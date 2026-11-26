@@ -1,0 +1,104 @@
+# Tasks for infra-lambda-budget-ledger-add. Run `task` to list them.
+#
+# Tasks that act on an AWS account need the AWS CLI profile of that account,
+# and the ones that deploy need the release of the function to deploy:
+#
+#   task plan PROFILE=<aws-cli-profile> VERSION=<release, for example 0.1.0>
+version: '3'
+
+env:
+  AWS_REGION: us-east-1
+  AWS_PAGER: ''
+
+vars:
+  # Where the releases of the function are published.
+  RELEASES_URL: https://github.com/iaireal/lambda-budget-ledger-add/releases/download
+
+tasks:
+  default:
+    desc: List the available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  download:
+    desc: Download a release of the function and verify its checksum (needs VERSION=<release>)
+    summary: |
+      Fetches bootstrap.zip and its SHA-256 checksum from the GitHub release
+      v<VERSION> of lambda-budget-ledger-add into artifacts/<VERSION>/, then
+      checks the zip against the checksum.
+    requires:
+      vars: [VERSION]
+    cmds:
+      - mkdir -p "artifacts/{{.VERSION}}"
+      - curl -fsSL -o "artifacts/{{.VERSION}}/bootstrap.zip" "{{.RELEASES_URL}}/v{{.VERSION}}/bootstrap.zip"
+      - curl -fsSL -o "artifacts/{{.VERSION}}/bootstrap.zip.sha256" "{{.RELEASES_URL}}/v{{.VERSION}}/bootstrap.zip.sha256"
+      - cd "artifacts/{{.VERSION}}" && sha256sum -c bootstrap.zip.sha256
+
+  init:
+    desc: Point Terraform at the account's state bucket (needs PROFILE=<profile>)
+    summary: |
+      The state bucket is created by infra-account-baseline. Runs with
+      -reconfigure because the bucket differs per account, so Terraform must
+      switch backends whenever PROFILE changes.
+    requires:
+      vars: [PROFILE]
+    env:
+      AWS_PROFILE: '{{.PROFILE}}'
+    cmds:
+      - |
+        # The bucket name contains the account ID, so it is looked up, not written.
+        bucket="iaireal-terraform-state-$(aws sts get-caller-identity --query Account --output text)"
+        terraform init -reconfigure -backend-config="bucket=$bucket"
+
+  fmt:
+    desc: Format the Terraform files
+    cmds:
+      - terraform fmt -recursive
+
+  validate:
+    desc: Check formatting and validate the configuration
+    cmds:
+      - terraform fmt -check -recursive
+      - terraform validate
+
+  plan:
+    desc: Show what would change and save the plan (needs PROFILE=<profile> VERSION=<release>)
+    requires:
+      vars: [PROFILE, VERSION]
+    env:
+      AWS_PROFILE: '{{.PROFILE}}'
+    cmds:
+      - task: download
+        vars: { VERSION: '{{.VERSION}}' }
+      - task: init
+        vars: { PROFILE: '{{.PROFILE}}' }
+      - terraform plan -var="function_version={{.VERSION}}" -out="tfplan-{{.PROFILE}}"
+
+  apply:
+    desc: Apply the plan saved by `task plan` for the same PROFILE
+    requires:
+      vars: [PROFILE]
+    env:
+      AWS_PROFILE: '{{.PROFILE}}'
+    preconditions:
+      - sh: test -f "tfplan-{{.PROFILE}}"
+        msg: No saved plan for {{.PROFILE}}. Run `task plan PROFILE={{.PROFILE}} VERSION=<release>` first and review it.
+    cmds:
+      - terraform apply "tfplan-{{.PROFILE}}"
+      - rm -f "tfplan-{{.PROFILE}}"
+
+  invoke:
+    desc: Call the deployed function with 2 and 3 and print its answer (needs PROFILE=<profile>)
+    requires:
+      vars: [PROFILE]
+    env:
+      AWS_PROFILE: '{{.PROFILE}}'
+    cmds:
+      - |
+        out=$(mktemp)
+        aws lambda invoke --function-name budget-ledger-add \
+          --cli-binary-format raw-in-base64-out \
+          --payload '{"left": 2, "right": 3}' "$out" >/dev/null
+        cat "$out"; echo
+        rm -f "$out"
